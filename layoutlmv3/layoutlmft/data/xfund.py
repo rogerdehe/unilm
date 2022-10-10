@@ -2,9 +2,10 @@ import os
 import json
 import importlib.util
 
+import numpy as np
 import torch
 from torch.utils.data.dataset import Dataset
-from PIL import Image
+import PIL
 from typing import List, Union
 
 _torch_available = importlib.util.find_spec("torch") is not None
@@ -550,8 +551,8 @@ class xfund_dataset(Dataset):
         }
         return res
 
-def pil_loader(path: str) -> Image.Image:
+def pil_loader(path: str) -> PIL.Image.Image:
     # open path as file to avoid ResourceWarning (https://github.com/python-pillow/Pillow/issues/835)
     with open(path, 'rb') as f:
-        img = Image.open(f)
+        img = PIL.Image.open(f)
         return img.convert('RGB')
