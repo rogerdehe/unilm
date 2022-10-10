@@ -1,12 +1,23 @@
 import os
 import json
+import importlib.util
 
 import torch
 from torch.utils.data.dataset import Dataset
 from PIL import Image
 from typing import List, Union
-from transformers.utils import is_torch_available
-from transformers.utils.generic import _is_torch
+
+_torch_available = importlib.util.find_spec("torch") is not None
+
+def is_torch_available():
+    return _torch_available
+
+
+def _is_torch(x):
+    import torch
+
+    return isinstance(x, torch.Tensor)
+
 
 def is_torch_tensor(obj):
     return _is_torch(obj) if is_torch_available() else False
