@@ -1,284 +1,384 @@
-import torchvision.transforms.functional as F
-import warnings
-import math
-import random
+import os
+from typing import List, Union
+
 import numpy as np
-from PIL import Image
-import torch
+import PIL.Image
+import PIL.ImageOps
 
-from detectron2.data.detection_utils import read_image
-from detectron2.data.transforms import ResizeTransform, TransformList
-
-def normalize_bbox(bbox, size):
-    return [
-        int(1000 * bbox[0] / size[0]),
-        int(1000 * bbox[1] / size[1]),
-        int(1000 * bbox[2] / size[0]),
-        int(1000 * bbox[3] / size[1]),
-    ]
+import requests
 
 
-def load_image(image_path):
-    image = read_image(image_path, format="BGR")
-    h = image.shape[0]
-    w = image.shape[1]
-    img_trans = TransformList([ResizeTransform(h=h, w=w, new_h=224, new_w=224)])
-    image = torch.tensor(img_trans.apply_image(image).copy()).permute(2, 0, 1)  # copy to make it writeable
-    return image, (w, h)
+_torch_available = importlib.util.find_spec("torch") is not None
+
+def is_torch_available():
+    return _torch_available
 
 
-def crop(image, i, j, h, w, boxes=None):
-    cropped_image = F.crop(image, i, j, h, w)
+def _is_torch(x):
+    import torch
 
-    if boxes is not None:
-        # Currently we cannot use this case since when some boxes is out of the cropped image,
-        # it may be better to drop out these boxes along with their text input (instead of min or clamp)
-        # which haven't been implemented here
-        max_size = torch.as_tensor([w, h], dtype=torch.float32)
-        cropped_boxes = torch.as_tensor(boxes) - torch.as_tensor([j, i, j, i])
-        cropped_boxes = torch.min(cropped_boxes.reshape(-1, 2, 2), max_size)
-        cropped_boxes = cropped_boxes.clamp(min=0)
-        boxes = cropped_boxes.reshape(-1, 4)
-
-    return cropped_image, boxes
+    return isinstance(x, torch.Tensor)
 
 
-def resize(image, size, interpolation, boxes=None):
-    # It seems that we do not need to resize boxes here, since the boxes will be resized to 1000x1000 finally,
-    # which is compatible with a square image size of 224x224
-    rescaled_image = F.resize(image, size, interpolation)
-
-    if boxes is None:
-        return rescaled_image, None
-
-    ratios = tuple(float(s) / float(s_orig) for s, s_orig in zip(rescaled_image.size, image.size))
-    ratio_width, ratio_height = ratios
-
-    # boxes = boxes.copy()
-    scaled_boxes = boxes * torch.as_tensor([ratio_width, ratio_height, ratio_width, ratio_height])
-
-    return rescaled_image, scaled_boxes
+def is_torch_tensor(obj):
+    return _is_torch(obj) if is_torch_available() else False
 
 
-def clamp(num, min_value, max_value):
-    return max(min(num, max_value), min_value)
-
-
-def get_bb(bb, page_size):
-    bbs = [float(j) for j in bb]
-    xs, ys = [], []
-    for i, b in enumerate(bbs):
-        if i % 2 == 0:
-            xs.append(b)
+def load_image(image: Union[str, "PIL.Image.Image"]) -> "PIL.Image.Image":
+    """
+    Loads `image` to a PIL Image.
+    Args:
+        image (`str` or `PIL.Image.Image`):
+            The image to convert to the PIL Image format.
+    Returns:
+        `PIL.Image.Image`: A PIL Image.
+    """
+    if isinstance(image, str):
+        if image.startswith("http://") or image.startswith("https://"):
+            # We need to actually check for a real protocol, otherwise it's impossible to use a local file
+            # like http_huggingface_co.png
+            image = PIL.Image.open(requests.get(image, stream=True).raw)
+        elif os.path.isfile(image):
+            image = PIL.Image.open(image)
         else:
-            ys.append(b)
-    (width, height) = page_size
-    return_bb = [
-        clamp(min(xs), 0, width - 1),
-        clamp(min(ys), 0, height - 1),
-        clamp(max(xs), 0, width - 1),
-        clamp(max(ys), 0, height - 1),
-    ]
-    return_bb = [
-            int(1000 * return_bb[0] / width),
-            int(1000 * return_bb[1] / height),
-            int(1000 * return_bb[2] / width),
-            int(1000 * return_bb[3] / height),
-        ]
-    return return_bb
-
-
-class ToNumpy:
-
-    def __call__(self, pil_img):
-        np_img = np.array(pil_img, dtype=np.uint8)
-        if np_img.ndim < 3:
-            np_img = np.expand_dims(np_img, axis=-1)
-        np_img = np.rollaxis(np_img, 2)  # HWC to CHW
-        return np_img
-
-
-class ToTensor:
-
-    def __init__(self, dtype=torch.float32):
-        self.dtype = dtype
-
-    def __call__(self, pil_img):
-        np_img = np.array(pil_img, dtype=np.uint8)
-        if np_img.ndim < 3:
-            np_img = np.expand_dims(np_img, axis=-1)
-        np_img = np.rollaxis(np_img, 2)  # HWC to CHW
-        return torch.from_numpy(np_img).to(dtype=self.dtype)
-
-
-_pil_interpolation_to_str = {
-    F.InterpolationMode.NEAREST: 'F.InterpolationMode.NEAREST',
-    F.InterpolationMode.BILINEAR: 'F.InterpolationMode.BILINEAR',
-    F.InterpolationMode.BICUBIC: 'F.InterpolationMode.BICUBIC',
-    F.InterpolationMode.LANCZOS: 'F.InterpolationMode.LANCZOS',
-    F.InterpolationMode.HAMMING: 'F.InterpolationMode.HAMMING',
-    F.InterpolationMode.BOX: 'F.InterpolationMode.BOX',
-}
-
-
-def _pil_interp(method):
-    if method == 'bicubic':
-        return F.InterpolationMode.BICUBIC
-    elif method == 'lanczos':
-        return F.InterpolationMode.LANCZOS
-    elif method == 'hamming':
-        return F.InterpolationMode.HAMMING
+            raise ValueError(
+                f"Incorrect path or url, URLs must start with `http://` or `https://`, and {image} is not a valid path"
+            )
+    elif isinstance(image, PIL.Image.Image):
+        image = image
     else:
-        # default bilinear, do we want to allow nearest?
-        return F.InterpolationMode.BILINEAR
+        raise ValueError(
+            "Incorrect format used for image. Should be an url linking to an image, a local path, or a PIL image."
+        )
+    image = PIL.ImageOps.exif_transpose(image)
+    image = image.convert("RGB")
+    return image
 
 
-class Compose:
-    """Composes several transforms together. This transform does not support torchscript.
-    Please, see the note below.
-
-    Args:
-        transforms (list of ``Transform`` objects): list of transforms to compose.
-
-    Example:
-        >>> transforms.Compose([
-        >>>     transforms.CenterCrop(10),
-        >>>     transforms.PILToTensor(),
-        >>>     transforms.ConvertImageDtype(torch.float),
-        >>> ])
-
-    .. note::
-        In order to script the transformations, please use ``torch.nn.Sequential`` as below.
-
-        >>> transforms = torch.nn.Sequential(
-        >>>     transforms.CenterCrop(10),
-        >>>     transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
-        >>> )
-        >>> scripted_transforms = torch.jit.script(transforms)
-
-        Make sure to use only scriptable transformations, i.e. that work with ``torch.Tensor``, does not require
-        `lambda` functions or ``PIL.Image``.
-
+# In the future we can add a TF implementation here when we have TF models.
+class ImageFeatureExtractionMixin:
+    """
+    Mixin that contain utilities for preparing image features.
     """
 
-    def __init__(self, transforms):
-        self.transforms = transforms
+    def _ensure_format_supported(self, image):
+        if not isinstance(image, (PIL.Image.Image, np.ndarray)) and not is_torch_tensor(image):
+            raise ValueError(
+                f"Got type {type(image)} which is not supported, only `PIL.Image.Image`, `np.array` and "
+                "`torch.Tensor` are."
+            )
 
-    def __call__(self, img, augmentation=False, box=None):
-        for t in self.transforms:
-            img = t(img, augmentation, box)
-        return img
+    def to_pil_image(self, image, rescale=None):
+        """
+        Converts `image` to a PIL Image. Optionally rescales it and puts the channel dimension back as the last axis if
+        needed.
+        Args:
+            image (`PIL.Image.Image` or `numpy.ndarray` or `torch.Tensor`):
+                The image to convert to the PIL Image format.
+            rescale (`bool`, *optional*):
+                Whether or not to apply the scaling factor (to make pixel values integers between 0 and 255). Will
+                default to `True` if the image type is a floating type, `False` otherwise.
+        """
+        self._ensure_format_supported(image)
 
+        if is_torch_tensor(image):
+            image = image.numpy()
 
-class RandomResizedCropAndInterpolationWithTwoPic:
-    """Crop the given PIL Image to random size and aspect ratio with random interpolation.
-    A crop of random size (default: of 0.08 to 1.0) of the original size and a random
-    aspect ratio (default: of 3/4 to 4/3) of the original aspect ratio is made. This crop
-    is finally resized to given size.
-    This is popularly used to train the Inception networks.
-    Args:
-        size: expected output size of each edge
-        scale: range of size of the origin size cropped
-        ratio: range of aspect ratio of the origin aspect ratio cropped
-        interpolation: Default: PIL.Image.BILINEAR
-    """
+        if isinstance(image, np.ndarray):
+            if rescale is None:
+                # rescale default to the array being of floating type.
+                rescale = isinstance(image.flat[0], np.floating)
+            # If the channel as been moved to first dim, we put it back at the end.
+            if image.ndim == 3 and image.shape[0] in [1, 3]:
+                image = image.transpose(1, 2, 0)
+            if rescale:
+                image = image * 255
+            image = image.astype(np.uint8)
+            return PIL.Image.fromarray(image)
+        return image
 
-    def __init__(self, size, second_size=None, scale=(0.08, 1.0), ratio=(3. / 4., 4. / 3.),
-                 interpolation='bilinear', second_interpolation='lanczos'):
-        if isinstance(size, tuple):
-            self.size = size
+    def convert_rgb(self, image):
+        """
+        Converts `PIL.Image.Image` to RGB format.
+        Args:
+            image (`PIL.Image.Image`):
+                The image to convert.
+        """
+        self._ensure_format_supported(image)
+        if not isinstance(image, PIL.Image.Image):
+            return image
+
+        return image.convert("RGB")
+
+    def rescale(self, image: np.ndarray, scale: Union[float, int]) -> np.ndarray:
+        """
+        Rescale a numpy image by scale amount
+        """
+        self._ensure_format_supported(image)
+        return image * scale
+
+    def to_numpy_array(self, image, rescale=None, channel_first=True):
+        """
+        Converts `image` to a numpy array. Optionally rescales it and puts the channel dimension as the first
+        dimension.
+        Args:
+            image (`PIL.Image.Image` or `np.ndarray` or `torch.Tensor`):
+                The image to convert to a NumPy array.
+            rescale (`bool`, *optional*):
+                Whether or not to apply the scaling factor (to make pixel values floats between 0. and 1.). Will
+                default to `True` if the image is a PIL Image or an array/tensor of integers, `False` otherwise.
+            channel_first (`bool`, *optional*, defaults to `True`):
+                Whether or not to permute the dimensions of the image to put the channel dimension first.
+        """
+        self._ensure_format_supported(image)
+
+        if isinstance(image, PIL.Image.Image):
+            image = np.array(image)
+
+        if is_torch_tensor(image):
+            image = image.numpy()
+
+        rescale = isinstance(image.flat[0], np.integer) if rescale is None else rescale
+
+        if rescale:
+            image = self.rescale(image.astype(np.float32), 1 / 255.0)
+
+        if channel_first and image.ndim == 3:
+            image = image.transpose(2, 0, 1)
+
+        return image
+
+    def expand_dims(self, image):
+        """
+        Expands 2-dimensional `image` to 3 dimensions.
+        Args:
+            image (`PIL.Image.Image` or `np.ndarray` or `torch.Tensor`):
+                The image to expand.
+        """
+        self._ensure_format_supported(image)
+
+        # Do nothing if PIL image
+        if isinstance(image, PIL.Image.Image):
+            return image
+
+        if is_torch_tensor(image):
+            image = image.unsqueeze(0)
         else:
-            self.size = (size, size)
-        if second_size is not None:
-            if isinstance(second_size, tuple):
-                self.second_size = second_size
+            image = np.expand_dims(image, axis=0)
+        return image
+
+    def normalize(self, image, mean, std, rescale=False):
+        """
+        Normalizes `image` with `mean` and `std`. Note that this will trigger a conversion of `image` to a NumPy array
+        if it's a PIL Image.
+        Args:
+            image (`PIL.Image.Image` or `np.ndarray` or `torch.Tensor`):
+                The image to normalize.
+            mean (`List[float]` or `np.ndarray` or `torch.Tensor`):
+                The mean (per channel) to use for normalization.
+            std (`List[float]` or `np.ndarray` or `torch.Tensor`):
+                The standard deviation (per channel) to use for normalization.
+            rescale (`bool`, *optional*, defaults to `False`):
+                Whether or not to rescale the image to be between 0 and 1. If a PIL image is provided, scaling will
+                happen automatically.
+        """
+        self._ensure_format_supported(image)
+
+        if isinstance(image, PIL.Image.Image):
+            image = self.to_numpy_array(image, rescale=True)
+        # If the input image is a PIL image, it automatically gets rescaled. If it's another
+        # type it may need rescaling.
+        elif rescale:
+            if isinstance(image, np.ndarray):
+                image = self.rescale(image.astype(np.float32), 1 / 255.0)
+            elif is_torch_tensor(image):
+                image = self.rescale(image.float(), 1 / 255.0)
+
+        if isinstance(image, np.ndarray):
+            if not isinstance(mean, np.ndarray):
+                mean = np.array(mean).astype(image.dtype)
+            if not isinstance(std, np.ndarray):
+                std = np.array(std).astype(image.dtype)
+        elif is_torch_tensor(image):
+            import torch
+
+            if not isinstance(mean, torch.Tensor):
+                mean = torch.tensor(mean)
+            if not isinstance(std, torch.Tensor):
+                std = torch.tensor(std)
+
+        if image.ndim == 3 and image.shape[0] in [1, 3]:
+            return (image - mean[:, None, None]) / std[:, None, None]
+        else:
+            return (image - mean) / std
+
+    def resize(self, image, size, resample=PIL.Image.BILINEAR, default_to_square=True, max_size=None):
+        """
+        Resizes `image`. Enforces conversion of input to PIL.Image.
+        Args:
+            image (`PIL.Image.Image` or `np.ndarray` or `torch.Tensor`):
+                The image to resize.
+            size (`int` or `Tuple[int, int]`):
+                The size to use for resizing the image. If `size` is a sequence like (h, w), output size will be
+                matched to this.
+                If `size` is an int and `default_to_square` is `True`, then image will be resized to (size, size). If
+                `size` is an int and `default_to_square` is `False`, then smaller edge of the image will be matched to
+                this number. i.e, if height > width, then image will be rescaled to (size * height / width, size).
+            resample (`int`, *optional*, defaults to `PIL.Image.BILINEAR`):
+                The filter to user for resampling.
+            default_to_square (`bool`, *optional*, defaults to `True`):
+                How to convert `size` when it is a single int. If set to `True`, the `size` will be converted to a
+                square (`size`,`size`). If set to `False`, will replicate
+                [`torchvision.transforms.Resize`](https://pytorch.org/vision/stable/transforms.html#torchvision.transforms.Resize)
+                with support for resizing only the smallest edge and providing an optional `max_size`.
+            max_size (`int`, *optional*, defaults to `None`):
+                The maximum allowed for the longer edge of the resized image: if the longer edge of the image is
+                greater than `max_size` after being resized according to `size`, then the image is resized again so
+                that the longer edge is equal to `max_size`. As a result, `size` might be overruled, i.e the smaller
+                edge may be shorter than `size`. Only used if `default_to_square` is `False`.
+        Returns:
+            image: A resized `PIL.Image.Image`.
+        """
+        self._ensure_format_supported(image)
+
+        if not isinstance(image, PIL.Image.Image):
+            image = self.to_pil_image(image)
+
+        if isinstance(size, list):
+            size = tuple(size)
+
+        if isinstance(size, int) or len(size) == 1:
+            if default_to_square:
+                size = (size, size) if isinstance(size, int) else (size[0], size[0])
             else:
-                self.second_size = (second_size, second_size)
-        else:
-            self.second_size = None
-        if (scale[0] > scale[1]) or (ratio[0] > ratio[1]):
-            warnings.warn("range should be of kind (min, max)")
+                width, height = image.size
+                # specified size only for the smallest edge
+                short, long = (width, height) if width <= height else (height, width)
+                requested_new_short = size if isinstance(size, int) else size[0]
 
-        self.interpolation = _pil_interp(interpolation)
-        self.second_interpolation = _pil_interp(second_interpolation)
-        self.scale = scale
-        self.ratio = ratio
+                if short == requested_new_short:
+                    return image
 
-    @staticmethod
-    def get_params(img, scale, ratio):
-        """Get parameters for ``crop`` for a random sized crop.
+                new_short, new_long = requested_new_short, int(requested_new_short * long / short)
+
+                if max_size is not None:
+                    if max_size <= requested_new_short:
+                        raise ValueError(
+                            f"max_size = {max_size} must be strictly greater than the requested "
+                            f"size for the smaller edge size = {size}"
+                        )
+                    if new_long > max_size:
+                        new_short, new_long = int(max_size * new_short / new_long), max_size
+
+                size = (new_short, new_long) if width <= height else (new_long, new_short)
+
+        return image.resize(size, resample=resample)
+
+    def center_crop(self, image, size):
+        """
+        Crops `image` to the given size using a center crop. Note that if the image is too small to be cropped to the
+        size given, it will be padded (so the returned result has the size asked).
         Args:
-            img (PIL Image): Image to be cropped.
-            scale (tuple): range of size of the origin size cropped
-            ratio (tuple): range of aspect ratio of the origin aspect ratio cropped
+            image (`PIL.Image.Image` or `np.ndarray` or `torch.Tensor` of shape (n_channels, height, width) or (height, width, n_channels)):
+                The image to resize.
+            size (`int` or `Tuple[int, int]`):
+                The size to which crop the image.
         Returns:
-            tuple: params (i, j, h, w) to be passed to ``crop`` for a random
-                sized crop.
+            new_image: A center cropped `PIL.Image.Image` or `np.ndarray` or `torch.Tensor` of shape: (n_channels,
+            height, width).
         """
-        area = img.size[0] * img.size[1]
+        self._ensure_format_supported(image)
 
-        for attempt in range(10):
-            target_area = random.uniform(*scale) * area
-            log_ratio = (math.log(ratio[0]), math.log(ratio[1]))
-            aspect_ratio = math.exp(random.uniform(*log_ratio))
+        if not isinstance(size, tuple):
+            size = (size, size)
 
-            w = int(round(math.sqrt(target_area * aspect_ratio)))
-            h = int(round(math.sqrt(target_area / aspect_ratio)))
-
-            if w <= img.size[0] and h <= img.size[1]:
-                i = random.randint(0, img.size[1] - h)
-                j = random.randint(0, img.size[0] - w)
-                return i, j, h, w
-
-        # Fallback to central crop
-        in_ratio = img.size[0] / img.size[1]
-        if in_ratio < min(ratio):
-            w = img.size[0]
-            h = int(round(w / min(ratio)))
-        elif in_ratio > max(ratio):
-            h = img.size[1]
-            w = int(round(h * max(ratio)))
-        else:  # whole image
-            w = img.size[0]
-            h = img.size[1]
-        i = (img.size[1] - h) // 2
-        j = (img.size[0] - w) // 2
-        return i, j, h, w
-
-    def __call__(self, img, augmentation=False, box=None):
-        """
-        Args:
-            img (PIL Image): Image to be cropped and resized.
-        Returns:
-            PIL Image: Randomly cropped and resized image.
-        """
-        if augmentation:
-            i, j, h, w = self.get_params(img, self.scale, self.ratio)
-            img = F.crop(img, i, j, h, w)
-            # img, box = crop(img, i, j, h, w, box)
-        img = F.resize(img, self.size, self.interpolation)
-        second_img = F.resize(img, self.second_size, self.second_interpolation) \
-            if self.second_size is not None else None
-        return img, second_img
-
-    def __repr__(self):
-        if isinstance(self.interpolation, (tuple, list)):
-            interpolate_str = ' '.join([_pil_interpolation_to_str[x] for x in self.interpolation])
+        # PIL Image.size is (width, height) but NumPy array and torch Tensors have (height, width)
+        if is_torch_tensor(image) or isinstance(image, np.ndarray):
+            if image.ndim == 2:
+                image = self.expand_dims(image)
+            image_shape = image.shape[1:] if image.shape[0] in [1, 3] else image.shape[:2]
         else:
-            interpolate_str = _pil_interpolation_to_str[self.interpolation]
-        format_string = self.__class__.__name__ + '(size={0}'.format(self.size)
-        format_string += ', scale={0}'.format(tuple(round(s, 4) for s in self.scale))
-        format_string += ', ratio={0}'.format(tuple(round(r, 4) for r in self.ratio))
-        format_string += ', interpolation={0}'.format(interpolate_str)
-        if self.second_size is not None:
-            format_string += ', second_size={0}'.format(self.second_size)
-            format_string += ', second_interpolation={0}'.format(_pil_interpolation_to_str[self.second_interpolation])
-        format_string += ')'
-        return format_string
+            image_shape = (image.size[1], image.size[0])
 
+        top = (image_shape[0] - size[0]) // 2
+        bottom = top + size[0]  # In case size is odd, (image_shape[0] + size[0]) // 2 won't give the proper result.
+        left = (image_shape[1] - size[1]) // 2
+        right = left + size[1]  # In case size is odd, (image_shape[1] + size[1]) // 2 won't give the proper result.
 
-def pil_loader(path: str) -> Image.Image:
-    # open path as file to avoid ResourceWarning (https://github.com/python-pillow/Pillow/issues/835)
-    with open(path, 'rb') as f:
-        img = Image.open(f)
-        return img.convert('RGB')
+        # For PIL Images we have a method to crop directly.
+        if isinstance(image, PIL.Image.Image):
+            return image.crop((left, top, right, bottom))
+
+        # Check if image is in (n_channels, height, width) or (height, width, n_channels) format
+        channel_first = True if image.shape[0] in [1, 3] else False
+
+        # Transpose (height, width, n_channels) format images
+        if not channel_first:
+            if isinstance(image, np.ndarray):
+                image = image.transpose(2, 0, 1)
+            if is_torch_tensor(image):
+                image = image.permute(2, 0, 1)
+
+        # Check if cropped area is within image boundaries
+        if top >= 0 and bottom <= image_shape[0] and left >= 0 and right <= image_shape[1]:
+            return image[..., top:bottom, left:right]
+
+        # Otherwise, we may need to pad if the image is too small. Oh joy...
+        new_shape = image.shape[:-2] + (max(size[0], image_shape[0]), max(size[1], image_shape[1]))
+        if isinstance(image, np.ndarray):
+            new_image = np.zeros_like(image, shape=new_shape)
+        elif is_torch_tensor(image):
+            new_image = image.new_zeros(new_shape)
+
+        top_pad = (new_shape[-2] - image_shape[0]) // 2
+        bottom_pad = top_pad + image_shape[0]
+        left_pad = (new_shape[-1] - image_shape[1]) // 2
+        right_pad = left_pad + image_shape[1]
+        new_image[..., top_pad:bottom_pad, left_pad:right_pad] = image
+
+        top += top_pad
+        bottom += top_pad
+        left += left_pad
+        right += left_pad
+
+        new_image = new_image[
+            ..., max(0, top) : min(new_image.shape[-2], bottom), max(0, left) : min(new_image.shape[-1], right)
+        ]
+
+        return new_image
+
+    def flip_channel_order(self, image):
+        """
+        Flips the channel order of `image` from RGB to BGR, or vice versa. Note that this will trigger a conversion of
+        `image` to a NumPy array if it's a PIL Image.
+        Args:
+            image (`PIL.Image.Image` or `np.ndarray` or `torch.Tensor`):
+                The image whose color channels to flip. If `np.ndarray` or `torch.Tensor`, the channel dimension should
+                be first.
+        """
+        self._ensure_format_supported(image)
+
+        if isinstance(image, PIL.Image.Image):
+            image = self.to_numpy_array(image)
+
+        return image[::-1, :, :]
+
+    def rotate(self, image, angle, resample=PIL.Image.NEAREST, expand=0, center=None, translate=None, fillcolor=None):
+        """
+        Returns a rotated copy of `image`. This method returns a copy of `image`, rotated the given number of degrees
+        counter clockwise around its centre.
+        Args:
+            image (`PIL.Image.Image` or `np.ndarray` or `torch.Tensor`):
+                The image to rotate. If `np.ndarray` or `torch.Tensor`, will be converted to `PIL.Image.Image` before
+                rotating.
+        Returns:
+            image: A rotated `PIL.Image.Image`.
+        """
+        self._ensure_format_supported(image)
+
+        if not isinstance(image, PIL.Image.Image):
+            image = self.to_pil_image(image)
+
+        return image.rotate(
+            angle, resample=resample, expand=expand, center=center, translate=translate, fillcolor=fillcolor
+        )
