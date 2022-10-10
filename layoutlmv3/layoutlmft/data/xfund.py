@@ -515,9 +515,15 @@ class xfund_dataset(Dataset):
         position_ids = self.feature['position_ids'][index]
 
         img = pil_loader(self.feature['image_path'][index])
+        resample_fns = {
+            "bicubic": PIL.Image.BICUBIC,
+            "lanczos": PIL.Image.LANCZOS,
+            "hamming": PIL.Image.HAMMING,
+            "blinear": PIL.Image.BILINEAR,
+        }
         # for_patches, _ = self.common_transform(img, augmentation=False)
         # patch = self.patch_transform(for_patches)
-        for_patches = resize(img, size=self.args.input_size)
+        for_patches = resize(img, size=self.args.input_size, resample=resample_fns.get(self.args.train_interpolation, resample_fns["blinear"]))
         patch = normalize(for_patches, mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
 
         assert len(input_ids) == len(attention_mask) == len(labels) == len(bbox) == len(segment_ids)
