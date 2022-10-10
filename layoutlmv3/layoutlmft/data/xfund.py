@@ -185,7 +185,7 @@ class xfund_dataset(Dataset):
             "hamming": Image.HAMMING,
             "blinear": Image.BILINEAR,
         }
-        for_patches = self.image_feature_extracto.resize(img, size=self.args.input_size, resample=resample_fns.get(self.args.train_interpolation, resample_fns["blinear"]))
+        for_patches = self.image_feature_extractor.resize(img, size=self.args.input_size, resample=resample_fns.get(self.args.train_interpolation, resample_fns["blinear"]))
         patch = self.image_feature_extractor.normalize(for_patches, mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
 
         assert len(input_ids) == len(attention_mask) == len(labels) == len(bbox) == len(segment_ids)
